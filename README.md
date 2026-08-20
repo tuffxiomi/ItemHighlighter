@@ -1,52 +1,79 @@
 # Item Highlighter
 
-Standalone Levi Launchroid / Preloader Android visual mod inspired by the Modrinth **Item Highlighter** concept.
+Standalone Levi Launchroid / Preloader Android visual mod inspired by the Java Edition Item Highlighter mod.
 
-## What it does
+## Behavior
 
-- Watches the player inventory while a container/inventory screen is open.
-- Establishes a baseline when the screen opens so old items are not highlighted immediately.
-- Detects inventory slot changes during the open screen.
-- Newly detected item stacks receive a small animated gold star for about 1.6 seconds.
-- Rendering is client-side only. It does not edit inventory data, send packets, or change gameplay state.
+Item Highlighter shows a small animated gold star over newly detected items in the Minecraft GUI.
 
-The detection method is intentionally conservative: it observes normal inventory-slot changes rather than trying to patch a network pickup packet. A stack count increase inside the same unchanged `ItemStackBase` object is not guaranteed to be detected.
+It is designed to work with:
 
-## BedrockTools research used
+- Hotbar
+- Player inventory
+- Container inventories
+- Other GUI item-rendering locations
 
-This project does **not** include BedrockTools source files, headers, `libminecraftpe.so`, or its module framework.
+The mod uses the native `ItemRendererRenderGuiItemNew` path to observe rendered items.
 
-The implementation independently uses the same native concepts observed in the supplied BedrockTools source:
+The marker itself is rendered after the complete `ScreenViewRender` pass using the active `MinecraftUIRenderContext`.
 
-- masked ARM64 signature resolution
-- Preloader detours
-- `ContainerScreenControllerOpen`
-- `ContainerScreenControllerGetItemStack`
-- `ScreenViewRender`
+## How it works
+
+The implementation uses the following native paths:
+
 - `ItemRendererRenderGuiItemNew`
-- `MinecraftUIRenderContext::DrawText` vtable slot 6
-- `MinecraftUIRenderContext::FillRectangle` vtable slot 16
+- `ScreenViewRender`
+- `MinecraftUIRenderContext::DrawText`
+- `MinecraftUIRenderContext::FillRectangle`
 
-Relevant object offsets reused from the audit/source analysis:
+The supplied BedrockTools source uses the same rendering-context technique:
 
-- `ItemStackBase` item pointer: `0x8`
-- shared-counter item pointer: `0x0`
-- `Item::mId`: `0x8A`
+1. `ScreenViewRender` defines the UI rendering pass.
+2. `DrawText` provides the active `MinecraftUIRenderContext`.
+3. `FillRectangle` is used to draw UI rectangles.
 
-The original BedrockTools audit found 104 signature IDs and 37 module implementation units. The new mod intentionally reimplements only the tiny subset needed for this feature.
+This project independently implements only the required functionality and does not include BedrockTools files.
 
-## Build
+## Highlight detection
 
-GitHub Actions builds with Android NDK 28 and CMake. The supplied reverse-engineering fixture is AArch64, so the workflow targets `arm64-v8a`.
+The mod establishes an initial baseline so existing hotbar/inventory items are not immediately highlighted.
 
-Local build prerequisites:
+After the baseline:
 
-- Android NDK 28.x
-- CMake 3.22+
-- Ninja
+- An empty slot becoming an item can be highlighted.
+- An item changing to another item can be highlighted.
+- An item auxiliary value changing can be highlighted.
 
-The GitHub workflow also packages a `.levipack` artifact.
+The implementation intentionally does not rely on the `ItemStack` pointer because temporary ItemStack objects may be used during GUI rendering.
 
-## Stability fix
+## Limitations
 
-This build resolves native signatures during the loader/background phase, removes the unsupported `ContainerScreenControllerDtor` dependency, and throttles inventory polling to 250 ms to avoid main-thread ANRs. See `CRASH_ANALYSIS.md`.
+A pickup that only changes the count of an existing stack while keeping the same item ID and auxiliary value may not be detected by this minimal renderer-based implementation.
+
+Detecting every stack-count change reliably would require an additional inventory-state hook or a verified ItemStack count field for the exact Minecraft build.
+
+## Stability
+
+The mod does not perform signature scanning from `enable()`.
+
+Native targets are resolved during `load()`.
+
+The mod also does not depend on:
+
+- `ContainerScreenControllerOpen`
+- `ContainerScreenControllerDtor`
+- inventory-wide polling
+
+This avoids the expensive main-thread work that caused the previous ANR.
+
+## Compatibility
+
+Target ABI:
+
+`arm64-v8a`
+
+Target library:
+
+`libminecraftpe.so`
+
+No BedrockTools source or `libminecraftpe.so` is bundled with this project.
