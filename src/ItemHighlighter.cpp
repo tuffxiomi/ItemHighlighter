@@ -6,44 +6,50 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
-#include <memory>
-#include <cmath>
 #include <vector>
 
 namespace item_highlighter {
 
 namespace {
 
-constexpr std::string_view kMinecraftLibrary = "libminecraftpe.so";
-constexpr std::size_t kInventorySlots = 36;
-constexpr double kHighlightDurationMs = 1600.0;
-constexpr std::size_t kUiFillRectangleVtableSlot = 16;
-constexpr std::string_view kUiContextTypeInfo = "24MinecraftUIRenderContext";
+constexpr std::string_view MinecraftLibrary = "libminecraftpe.so";
+constexpr std::string_view UiContextTypeInfo =
+    "24MinecraftUIRenderContext";
 
-// These are the BedrockTools signatures used by this standalone mod.
-// The project intentionally defines only the signatures it needs.
-constexpr std::string_view kSigContainerOpen =
-    "? ? ? A9 ? ? ? F9 FD 03 00 91 F3 03 00 AA ? ? ? 94 ? ? ? F9 E1 03 1F 2A ? ? ? 94";
+constexpr std::size_t DrawTextVtableSlot = 6;
+constexpr std::size_t FillRectangleVtableSlot = 16;
 
-constexpr std::string_view kSigContainerGetItemStack =
-    "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? 91 54 D0 3B D5 F3 03 00 AA ? ? ? 91 ? ? ? F9 ? ? ? F8 ? ? ? 95 ? ? ? F9 ? ? ? F9 ? ? ? 91";
+constexpr std::chrono::milliseconds MarkerLifetime{1600};
 
-constexpr std::string_view kSigScreenViewRender =
-    "? ? ? FC ? ? ? 6D ? ? ? 6D ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 ? ? ? D1 48 D0 3B D5 FC 03 00 AA";
+// Exact signatures from the supplied BedrockTools source.
+constexpr std::string_view ItemRendererRenderGuiItemNewSignature =
+    "? ? ? D1 ? ? ? FD ? ? ? 6D ? ? ? 6D "
+    "? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 "
+    "? ? ? A9 ? ? ? A9 ? ? ? 91 5B D0 3B D5 "
+    "F4 03 00 AA";
 
-constexpr std::string_view kSigItemRendererGui =
-    "? ? ? D1 ? ? ? FD ? ? ? 6D ? ? ? 6D ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 5B D0 3B D5 F4 03 00 AA";
+constexpr std::string_view ScreenViewRenderSignature =
+    "? ? ? FC ? ? ? 6D ? ? ? 6D "
+    "? ? ? A9 ? ? ? A9 ? ? ? A9 "
+    "? ? ? A9 ? ? ? A9 ? ? ? A9 "
+    "? ? ? 91 ? ? ? D1 48 D0 3B D5 "
+    "FC 03 00 AA";
 
-constexpr std::string_view kSigItemDamage =
-    "? ? ? D1 ? ? ? A9 ? ? ? A9 ? ? ? A9 ? ? ? 91 55 D0 3B D5 ? ? ? F9 ? ? ? F8 ? ? ? F9 ? ? ? B4 ? ? ? F9 ? ? ? B4 E8 03 00 AA";
+// ItemStackBase -> SharedCounter pointer.
+constexpr std::size_t ItemStackBaseItemOffset = 0x8;
 
-constexpr std::size_t kItemStackItemOffset = 0x8;
-constexpr std::size_t kSharedCounterPointerOffset = 0x0;
-constexpr std::size_t kItemIdOffset = 0x8A;
+// SharedCounter -> Item pointer.
+constexpr std::size_t SharedCounterPointerOffset = 0x0;
+
+// Item -> mId.
+constexpr std::size_t ItemIdOffset = 0x8A;
 
 struct Color {
     float r;
@@ -69,74 +75,101 @@ enum class TextAlignment : std::uint8_t {
     Center
 };
 
-using ContainerScreenFn =
-    void* (*)(void*, void*, void*, void*, void*, void*, void*, void*);
-
-using ContainerGetItemStackFn =
-    void* (*)(void*, const std::string&, int);
+using ItemRendererRenderGuiItemNewFn =
+    std::uint64_t (*)(
+        void*,
+        void*,
+        void*,
+        unsigned int,
+        unsigned char,
+        std::uint64_t,
+        float,
+        float,
+        float,
+        float,
+        float
+    );
 
 using ScreenViewRenderFn =
-    void (*)(void*, void*, void*, void*, void*, void*, void*, void*);
-
-using ItemRendererRenderGuiItemNewFn =
-    std::uint64_t (*)(void*, void*, void*, unsigned int, unsigned char,
-                      std::uint64_t, float, float, float, float, float);
-
-using ItemStackBaseGetDamageValueFn =
-    short (*)(void*);
+    void (*)(
+        void*,
+        void*,
+        void*,
+        void*,
+        void*,
+        void*,
+        void*,
+        void*
+    );
 
 using DrawTextFn =
-    void (*)(void*, Font&, const RectangleArea&, const std::string&,
-             const Color&, TextAlignment, float,
-             const TextMeasureData&, const CaretMeasureData&);
+    void (*)(
+        void*,
+        Font&,
+        const RectangleArea&,
+        const std::string&,
+        const Color&,
+        TextAlignment,
+        float,
+        const TextMeasureData&,
+        const CaretMeasureData&
+    );
 
 using FillRectangleFn =
-    void (*)(void*, const RectangleArea&, const Color&, float);
+    void (*)(
+        void*,
+        const RectangleArea&,
+        const Color&,
+        float
+    );
 
-struct SlotState {
+struct RenderSlot {
+    bool initialized = false;
+
     std::uint16_t itemId = 0;
-    short damage = 0;
-    bool valid = false;
+    unsigned int aux = 0;
+
+    float x = 0.0f;
+    float y = 0.0f;
 };
 
 struct Marker {
-    void* stack = nullptr;
     float x = 0.0f;
     float y = 0.0f;
+
     std::chrono::steady_clock::time_point expires{};
 };
 
-std::chrono::steady_clock::time_point gNextPoll{};
-constexpr std::chrono::milliseconds kPollInterval{250};
-
-ContainerScreenFn gContainerOpenOriginal = nullptr;
-ScreenViewRenderFn gScreenViewRenderOriginal = nullptr;
 ItemRendererRenderGuiItemNewFn gItemRendererOriginal = nullptr;
+ScreenViewRenderFn gScreenViewRenderOriginal = nullptr;
 DrawTextFn gDrawTextOriginal = nullptr;
-ContainerGetItemStackFn gContainerGetItemStack = nullptr;
-ItemStackBaseGetDamageValueFn gItemDamage = nullptr;
 FillRectangleFn gFillRectangle = nullptr;
 
-void* gController = nullptr;
-void* gUiContext = nullptr;
+void* gActiveUiContext = nullptr;
 
-std::array<SlotState, kInventorySlots> gSlots{};
-bool gBaselineReady = false;
 bool gEnabled = false;
+bool gBaselineReady = false;
 
+std::array<RenderSlot, 128> gRenderSlots{};
 std::vector<Marker> gMarkers;
+
 std::vector<std::unique_ptr<pl::memory::HookHandle>> gHooks;
 
-std::uint16_t readItemId(void* stack) {
+bool samePosition(float a, float b) {
+    return std::fabs(a - b) < 0.75f;
+}
+
+std::uint16_t getItemId(void* stack) {
     if (!stack) {
         return 0;
     }
 
-    auto* stackBytes = static_cast<std::byte*>(stack);
+    auto* stackBytes =
+        static_cast<std::byte*>(stack);
 
     void* counter =
         *reinterpret_cast<void**>(
-            stackBytes + kItemStackItemOffset
+            stackBytes + ItemStackBaseItemOffset
         );
 
     if (!counter) {
@@ -146,7 +179,7 @@ std::uint16_t readItemId(void* stack) {
     void* item =
         *reinterpret_cast<void**>(
             static_cast<std::byte*>(counter) +
-            kSharedCounterPointerOffset
+            SharedCounterPointerOffset
         );
 
     if (!item) {
@@ -154,286 +187,270 @@ std::uint16_t readItemId(void* stack) {
     }
 
     return *reinterpret_cast<std::uint16_t*>(
-        static_cast<std::byte*>(item) + kItemIdOffset
+        static_cast<std::byte*>(item) +
+        ItemIdOffset
     );
 }
 
-short readDamage(void* stack) {
-    if (!stack || !gItemDamage) {
-        return 0;
+RenderSlot* findRenderSlot(float x, float y) {
+    /*
+     * GUI positions are much more stable than ItemStack pointers.
+     *
+     * We intentionally do NOT use the stack pointer as the identity
+     * because Minecraft can use temporary/copy ItemStack objects while
+     * rendering.
+     */
+    for (auto& slot : gRenderSlots) {
+        if (!slot.initialized) {
+            continue;
+        }
+
+        if (samePosition(slot.x, x) &&
+            samePosition(slot.y, y)) {
+            return &slot;
+        }
     }
 
-    return gItemDamage(stack);
-}
-
-bool validStack(void* stack) {
-    return stack != nullptr && readItemId(stack) != 0;
-}
-
-void clearInventoryState() {
-    gController = nullptr;
-    gBaselineReady = false;
-    gNextPoll = {};
-    gSlots.fill({});
-    gMarkers.clear();
-}
-
-void purgeMarkers() {
-    const auto now = std::chrono::steady_clock::now();
-
-    gMarkers.erase(
-        std::remove_if(
-            gMarkers.begin(),
-            gMarkers.end(),
-            [&](const Marker& marker) {
-                return marker.stack == nullptr ||
-                       marker.expires <= now;
-            }
-        ),
-        gMarkers.end()
-    );
-}
-
-void markStack(void* stack) {
-    if (!validStack(stack)) {
-        return;
+    for (auto& slot : gRenderSlots) {
+        if (!slot.initialized) {
+            return &slot;
+        }
     }
 
-    const auto now = std::chrono::steady_clock::now();
+    return nullptr;
+}
+
+void addMarker(float x, float y) {
+    const auto expires =
+        std::chrono::steady_clock::now() +
+        MarkerLifetime;
 
     for (auto& marker : gMarkers) {
-        if (marker.stack == stack) {
-            marker.expires =
-                now +
-                std::chrono::milliseconds(
-                    static_cast<int>(kHighlightDurationMs)
-                );
+        if (samePosition(marker.x, x) &&
+            samePosition(marker.y, y)) {
+            marker.expires = expires;
             return;
         }
     }
 
     gMarkers.push_back(
         Marker{
-            stack,
-            0.0f,
-            0.0f,
-            now +
-                std::chrono::milliseconds(
-                    static_cast<int>(kHighlightDurationMs)
-                )
+            x,
+            y,
+            expires
         }
     );
 }
 
-void pollInventory() {
-    if (!gController || !gContainerGetItemStack) {
-        return;
-    }
+void purgeExpiredMarkers() {
+    const auto now =
+        std::chrono::steady_clock::now();
 
-    const auto now = std::chrono::steady_clock::now();
-
-    // Prevent a full native inventory scan every render frame.
-    if (now < gNextPoll) {
-        return;
-    }
-
-    gNextPoll = now + kPollInterval;
-
-    std::array<SlotState, kInventorySlots> current{};
-
-    for (std::size_t i = 0; i < kInventorySlots; ++i) {
-        void* stack =
-            gContainerGetItemStack(
-                gController,
-                "inventory_items",
-                static_cast<int>(i)
-            );
-
-        current[i].itemId = readItemId(stack);
-        current[i].damage = readDamage(stack);
-        current[i].valid = validStack(stack);
-
-        if (gBaselineReady) {
-            const bool changed =
-                (!gSlots[i].valid && current[i].valid) ||
-                (gSlots[i].valid && !current[i].valid) ||
-                (gSlots[i].valid &&
-                 current[i].valid &&
-                 (gSlots[i].itemId != current[i].itemId ||
-                  gSlots[i].damage != current[i].damage));
-
-            if (changed && current[i].valid) {
-                markStack(stack);
+    gMarkers.erase(
+        std::remove_if(
+            gMarkers.begin(),
+            gMarkers.end(),
+            [&](const Marker& marker) {
+                return marker.expires <= now;
             }
-        }
-    }
-
-    gSlots = current;
-    gBaselineReady = true;
-
-    purgeMarkers();
+        ),
+        gMarkers.end()
+    );
 }
 
-bool isMarked(void* stack) {
-    const auto now = std::chrono::steady_clock::now();
-
-    for (const auto& marker : gMarkers) {
-        if (marker.stack == stack &&
-            marker.expires > now) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-void rememberRender(void* stack, float x, float y) {
-    if (!stack || !isMarked(stack)) {
-        return;
-    }
-
-    for (auto& marker : gMarkers) {
-        if (marker.stack == stack) {
-            marker.x = x;
-            marker.y = y;
-            break;
-        }
-    }
-}
-
-void drawStar(void* context, float x, float y) {
+void drawStar(
+    void* context,
+    float x,
+    float y
+) {
     if (!context || !gFillRectangle) {
         return;
     }
 
-    const float phase =
-        static_cast<float>(
-            std::chrono::duration_cast<
-                std::chrono::milliseconds
-            >(
-                std::chrono::steady_clock::now()
-                    .time_since_epoch()
-            ).count()
-        );
+    const auto milliseconds =
+        std::chrono::duration_cast<
+            std::chrono::milliseconds
+        >(
+            std::chrono::steady_clock::now()
+                .time_since_epoch()
+        ).count();
+
+    const float time =
+        static_cast<float>(milliseconds);
 
     const float pulse =
-        0.70f +
-        0.30f *
-            (0.5f +
-             0.5f *
-                 std::sin(
-                     phase * 0.010f
-                 ));
+        0.75f +
+        0.25f *
+            (
+                0.5f +
+                0.5f *
+                    std::sin(
+                        time * 0.012f
+                    )
+            );
 
-    const Color color{
+    const Color gold{
         1.0f,
         0.86f,
-        0.20f,
+        0.18f,
         pulse
     };
 
-    // Small four-point star near the upper-right
-    // corner of the item.
-    const float cx = x + 13.0f;
-    const float cy = y + 2.0f;
+    /*
+     * The marker is deliberately small so it behaves like
+     * the Java Item Highlighter's star rather than covering
+     * the entire item.
+     */
+    const float centerX = x + 13.0f;
+    const float centerY = y + 1.0f;
 
+    // Vertical beam.
     gFillRectangle(
         context,
         {
-            cx - 1.0f,
-            cx + 1.0f,
-            cy - 4.0f,
-            cy + 4.0f
+            centerX - 1.0f,
+            centerX + 1.0f,
+            centerY - 5.0f,
+            centerY + 5.0f
         },
-        color,
+        gold,
         1.0f
     );
 
+    // Horizontal beam.
     gFillRectangle(
         context,
         {
-            cx - 4.0f,
-            cx + 4.0f,
-            cy - 1.0f,
-            cy + 1.0f
+            centerX - 5.0f,
+            centerX + 5.0f,
+            centerY - 1.0f,
+            centerY + 1.0f
         },
-        color,
+        gold,
         1.0f
     );
 
+    // Center.
     gFillRectangle(
         context,
         {
-            cx - 0.75f,
-            cx + 0.75f,
-            cy - 6.0f,
-            cy - 3.0f
+            centerX - 2.0f,
+            centerX + 2.0f,
+            centerY - 2.0f,
+            centerY + 2.0f
         },
-        color,
-        1.0f
-    );
-
-    gFillRectangle(
-        context,
-        {
-            cx + 3.0f,
-            cx + 4.5f,
-            cy - 0.75f,
-            cy + 0.75f
-        },
-        color,
+        gold,
         1.0f
     );
 }
 
-void renderMarkers() {
-    if (!gUiContext) {
+void drawAllMarkers(void* context) {
+    if (!context || !gFillRectangle) {
         return;
     }
 
-    purgeMarkers();
-
-    const auto now = std::chrono::steady_clock::now();
+    purgeExpiredMarkers();
 
     for (const auto& marker : gMarkers) {
-        if (marker.stack &&
-            marker.x != 0.0f &&
-            marker.y != 0.0f &&
-            marker.expires > now) {
-            drawStar(
-                gUiContext,
-                marker.x,
-                marker.y
-            );
-        }
+        drawStar(
+            context,
+            marker.x,
+            marker.y
+        );
     }
 }
 
-void* containerOpenHook(
-    void* a0,
-    void* a1,
-    void* a2,
-    void* a3,
-    void* a4,
-    void* a5,
-    void* a6,
-    void* a7
+void observeItem(
+    void* stack,
+    unsigned int aux,
+    float x,
+    float y
 ) {
-    void* result =
-        gContainerOpenOriginal
-            ? gContainerOpenOriginal(
-                  a0, a1, a2, a3,
-                  a4, a5, a6, a7
-              )
-            : nullptr;
-
-    if (!gEnabled) {
-        return result;
+    if (!gEnabled || !stack) {
+        return;
     }
 
-    gController = a0;
-    gBaselineReady = false;
-    gSlots.fill({});
+    const std::uint16_t itemId =
+        getItemId(stack);
+
+    if (itemId == 0) {
+        return;
+    }
+
+    RenderSlot* slot =
+        findRenderSlot(x, y);
+
+    if (!slot) {
+        return;
+    }
+
+    if (!gBaselineReady) {
+        slot->initialized = true;
+        slot->itemId = itemId;
+        slot->aux = aux;
+        slot->x = x;
+        slot->y = y;
+        return;
+    }
+
+    const bool changed =
+        !slot->initialized ||
+        slot->itemId != itemId ||
+        slot->aux != aux;
+
+    /*
+     * Do not highlight the initial inventory/hotbar contents.
+     * Only changes after the initial baseline are marked.
+     */
+    if (slot->initialized && changed) {
+        addMarker(x, y);
+    }
+
+    slot->initialized = true;
+    slot->itemId = itemId;
+    slot->aux = aux;
+    slot->x = x;
+    slot->y = y;
+}
+
+std::uint64_t itemRendererHook(
+    void* itemRenderer,
+    void* baseActorRenderContext,
+    void* stack,
+    unsigned int aux,
+    unsigned char mode,
+    std::uint64_t a6,
+    float x,
+    float y,
+    float sx,
+    float sy,
+    float sz
+) {
+    const std::uint64_t result =
+        gItemRendererOriginal
+            ? gItemRendererOriginal(
+                itemRenderer,
+                baseActorRenderContext,
+                stack,
+                aux,
+                mode,
+                a6,
+                x,
+                y,
+                sx,
+                sy,
+                sz
+            )
+            : 0;
+
+    if (gEnabled) {
+        observeItem(
+            stack,
+            aux,
+            x,
+            y
+        );
+    }
 
     return result;
 }
@@ -449,8 +466,14 @@ void drawTextHook(
     const TextMeasureData& measure,
     const CaretMeasureData& caret
 ) {
+    /*
+     * This is the important part:
+     *
+     * BedrockTools captures the active MinecraftUIRenderContext
+     * from DrawText. We do the same thing.
+     */
     if (gEnabled) {
-        gUiContext = self;
+        gActiveUiContext = self;
     }
 
     if (gDrawTextOriginal) {
@@ -478,25 +501,12 @@ void screenViewRenderHook(
     void* a7,
     void* a8
 ) {
-    if (!gEnabled) {
-        if (gScreenViewRenderOriginal) {
-            gScreenViewRenderOriginal(
-                self,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                a7,
-                a8
-            );
-        }
-        return;
-    }
-
-    gUiContext = nullptr;
-
-    pollInventory();
+    /*
+     * Reset the context at the beginning of each UI render pass.
+     * DrawTextHook will set it again while the original render
+     * function executes.
+     */
+    gActiveUiContext = nullptr;
 
     if (gScreenViewRenderOriginal) {
         gScreenViewRenderOriginal(
@@ -511,48 +521,35 @@ void screenViewRenderHook(
         );
     }
 
-    renderMarkers();
-}
+    if (!gEnabled) {
+        return;
+    }
 
-std::uint64_t itemRendererHook(
-    void* itemRenderer,
-    void* baseActorRenderContext,
-    void* stack,
-    unsigned int aux,
-    unsigned char mode,
-    std::uint64_t a6,
-    float x,
-    float y,
-    float sx,
-    float sy,
-    float sz
-) {
-    std::uint64_t result =
-        gItemRendererOriginal
-            ? gItemRendererOriginal(
-                  itemRenderer,
-                  baseActorRenderContext,
-                  stack,
-                  aux,
-                  mode,
-                  a6,
-                  x,
-                  y,
-                  sx,
-                  sy,
-                  sz
-              )
-            : 0;
-
-    if (gEnabled) {
-        rememberRender(
-            stack,
-            x,
-            y
+    /*
+     * ItemRendererRenderGuiItemNew ran during the original
+     * ScreenViewRender call, so the slot positions have now
+     * been observed.
+     *
+     * Draw after the vanilla UI render pass so the star is
+     * visible above the item.
+     */
+    if (gActiveUiContext) {
+        drawAllMarkers(
+            gActiveUiContext
         );
     }
 
-    return result;
+    purgeExpiredMarkers();
+}
+
+void clearState() {
+    gActiveUiContext = nullptr;
+
+    gBaselineReady = false;
+
+    gRenderSlots.fill({});
+
+    gMarkers.clear();
 }
 
 } // namespace
@@ -565,26 +562,27 @@ public:
     }
 
     bool load() {
-        auto& logger = getLogger();
+        auto& logger =
+            loggerRef();
 
         logger.info(
             "Loading Item Highlighter..."
         );
 
         /*
-         * Resolve everything during the loader/background phase.
+         * Resolve BOTH render signatures before enable().
          *
-         * The previous build performed multiple full-library scans
-         * from enable(), which runs on the Android main thread and
-         * can cause an ANR while scanning the large
-         * libminecraftpe.so image.
+         * No signature scanning occurs from enable(), which avoids
+         * repeating expensive libminecraftpe.so scans on the
+         * Android main thread.
          */
         std::vector<std::string> signatures{
-            std::string(kSigContainerOpen),
-            std::string(kSigContainerGetItemStack),
-            std::string(kSigScreenViewRender),
-            std::string(kSigItemRendererGui),
-            std::string(kSigItemDamage)
+            std::string(
+                ItemRendererRenderGuiItemNewSignature
+            ),
+            std::string(
+                ScreenViewRenderSignature
+            )
         };
 
         const auto resolved =
@@ -593,256 +591,231 @@ public:
                     signatures.data(),
                     signatures.size()
                 ),
-                kMinecraftLibrary
+                MinecraftLibrary
             );
 
-        auto getResolved =
-            [&](std::string_view signature) -> uintptr_t {
-                auto it =
-                    resolved.find(
-                        std::string(signature)
-                    );
-
-                return it == resolved.end()
-                    ? 0
-                    : it->second;
-            };
-
-        gContainerOpenOriginal =
-            reinterpret_cast<ContainerScreenFn>(
-                getResolved(kSigContainerOpen)
+        const auto itemIt =
+            resolved.find(
+                std::string(
+                    ItemRendererRenderGuiItemNewSignature
+                )
             );
 
-        if (!gContainerOpenOriginal) {
-            logger.warn(
-                "ContainerScreenControllerOpen signature not found"
-            );
+        if (itemIt != resolved.end()) {
+            gItemRendererOriginal =
+                reinterpret_cast<
+                    ItemRendererRenderGuiItemNewFn
+                >(
+                    itemIt->second
+                );
         }
 
-        gContainerGetItemStack =
-            reinterpret_cast<ContainerGetItemStackFn>(
-                getResolved(kSigContainerGetItemStack)
+        const auto screenIt =
+            resolved.find(
+                std::string(
+                    ScreenViewRenderSignature
+                )
             );
 
-        if (!gContainerGetItemStack) {
-            logger.warn(
-                "ContainerScreenControllerGetItemStack signature not found"
-            );
+        if (screenIt != resolved.end()) {
+            gScreenViewRenderOriginal =
+                reinterpret_cast<
+                    ScreenViewRenderFn
+                >(
+                    screenIt->second
+                );
         }
-
-        gScreenViewRenderOriginal =
-            reinterpret_cast<ScreenViewRenderFn>(
-                getResolved(kSigScreenViewRender)
-            );
-
-        if (!gScreenViewRenderOriginal) {
-            logger.warn(
-                "ScreenViewRender signature not found"
-            );
-        }
-
-        gItemRendererOriginal =
-            reinterpret_cast<
-                ItemRendererRenderGuiItemNewFn
-            >(
-                getResolved(kSigItemRendererGui)
-            );
 
         if (!gItemRendererOriginal) {
-            logger.warn(
-                "ItemRendererRenderGuiItemNew signature not found"
+            logger.error(
+                "ItemRendererRenderGuiItemNew "
+                "signature not found"
             );
+
+            return false;
         }
 
-        gItemDamage =
-            reinterpret_cast<
-                ItemStackBaseGetDamageValueFn
-            >(
-                getResolved(kSigItemDamage)
+        if (!gScreenViewRenderOriginal) {
+            logger.error(
+                "ScreenViewRender signature not found"
             );
 
-        if (!gItemDamage) {
-            logger.warn(
-                "ItemStackBaseGetDamageValue signature not found"
-            );
-        }
-
-        const auto drawTextAddress =
-            pl::memory::resolveVtableFunction(
-                kUiContextTypeInfo,
-                6,
-                kMinecraftLibrary
-            );
-
-        if (!drawTextAddress) {
-            logger.warn(
-                "MinecraftUIRenderContext::DrawText "
-                "vtable slot could not be resolved"
-            );
-        }
-
-        const auto fillRectAddress =
-            pl::memory::resolveVtableFunction(
-                kUiContextTypeInfo,
-                kUiFillRectangleVtableSlot,
-                kMinecraftLibrary
-            );
-
-        if (fillRectAddress) {
-            gFillRectangle =
-                reinterpret_cast<FillRectangleFn>(
-                    fillRectAddress
-                );
-        } else {
-            logger.warn(
-                "MinecraftUIRenderContext::FillRectangle "
-                "vtable slot could not be resolved"
-            );
+            return false;
         }
 
         /*
-         * Save the DrawText address now.
-         * No expensive library/signature scan is left for enable().
+         * Resolve UI vtable functions.
+         *
+         * These are the same vtable slots used by the supplied
+         * BedrockTools ShulkerPreview implementation.
          */
+        const uintptr_t drawTextAddress =
+            pl::memory::resolveVtableFunction(
+                UiContextTypeInfo,
+                DrawTextVtableSlot,
+                MinecraftLibrary
+            );
+
+        if (!drawTextAddress) {
+            logger.error(
+                "MinecraftUIRenderContext DrawText "
+                "vtable slot not found"
+            );
+
+            return false;
+        }
+
+        const uintptr_t fillRectangleAddress =
+            pl::memory::resolveVtableFunction(
+                UiContextTypeInfo,
+                FillRectangleVtableSlot,
+                MinecraftLibrary
+            );
+
+        if (!fillRectangleAddress) {
+            logger.error(
+                "MinecraftUIRenderContext FillRectangle "
+                "vtable slot not found"
+            );
+
+            return false;
+        }
+
         gDrawTextOriginal =
             reinterpret_cast<DrawTextFn>(
                 drawTextAddress
             );
 
+        gFillRectangle =
+            reinterpret_cast<FillRectangleFn>(
+                fillRectangleAddress
+            );
+
+        logger.info(
+            "Item Highlighter native targets resolved"
+        );
+
         return true;
     }
 
     bool enable() {
-        auto& logger = getLogger();
-
         if (gEnabled) {
             return true;
         }
 
+        auto& logger =
+            loggerRef();
+
+        logger.info(
+            "Enabling Item Highlighter..."
+        );
+
+        clearState();
+
+        /*
+         * Hook ScreenViewRender first.
+         *
+         * This gives us a reliable UI-render boundary.
+         */
+        auto screenHook =
+            std::make_unique<
+                pl::memory::HookHandle
+            >(
+                reinterpret_cast<void*>(
+                    gScreenViewRenderOriginal
+                ),
+                reinterpret_cast<void*>(
+                    screenViewRenderHook
+                ),
+                reinterpret_cast<void**>(
+                    &gScreenViewRenderOriginal
+                )
+            );
+
+        if (!screenHook->installed()) {
+            logger.error(
+                "Failed to hook ScreenViewRender"
+            );
+
+            return false;
+        }
+
+        gHooks.push_back(
+            std::move(screenHook)
+        );
+
+        /*
+         * Hook the GUI item renderer.
+         *
+         * This observes hotbar and inventory items.
+         */
+        auto itemHook =
+            std::make_unique<
+                pl::memory::HookHandle
+            >(
+                reinterpret_cast<void*>(
+                    gItemRendererOriginal
+                ),
+                reinterpret_cast<void*>(
+                    itemRendererHook
+                ),
+                reinterpret_cast<void**>(
+                    &gItemRendererOriginal
+                )
+            );
+
+        if (!itemHook->installed()) {
+            gHooks.clear();
+
+            logger.error(
+                "Failed to hook "
+                "ItemRendererRenderGuiItemNew"
+            );
+
+            return false;
+        }
+
+        gHooks.push_back(
+            std::move(itemHook)
+        );
+
+        /*
+         * Finally capture MinecraftUIRenderContext from DrawText.
+         */
+        auto drawTextHookHandle =
+            std::make_unique<
+                pl::memory::HookHandle
+            >(
+                reinterpret_cast<void*>(
+                    gDrawTextOriginal
+                ),
+                reinterpret_cast<void*>(
+                    drawTextHook
+                ),
+                reinterpret_cast<void**>(
+                    &gDrawTextOriginal
+                )
+            );
+
+        if (!drawTextHookHandle->installed()) {
+            gHooks.clear();
+
+            logger.error(
+                "Failed to hook "
+                "MinecraftUIRenderContext::DrawText"
+            );
+
+            return false;
+        }
+
+        gHooks.push_back(
+            std::move(drawTextHookHandle)
+        );
+
         gEnabled = true;
 
         logger.info(
-            "Enabling Item Highlighter"
-        );
-
-        if (gContainerOpenOriginal) {
-            auto hook =
-                std::make_unique<
-                    pl::memory::HookHandle
-                >(
-                    reinterpret_cast<void*>(
-                        gContainerOpenOriginal
-                    ),
-                    reinterpret_cast<void*>(
-                        containerOpenHook
-                    ),
-                    reinterpret_cast<void**>(
-                        &gContainerOpenOriginal
-                    )
-                );
-
-            if (hook->installed()) {
-                gHooks.push_back(
-                    std::move(hook)
-                );
-            } else {
-                logger.warn(
-                    "ContainerScreenControllerOpen "
-                    "hook installation failed"
-                );
-            }
-        }
-
-        if (gScreenViewRenderOriginal) {
-            auto hook =
-                std::make_unique<
-                    pl::memory::HookHandle
-                >(
-                    reinterpret_cast<void*>(
-                        gScreenViewRenderOriginal
-                    ),
-                    reinterpret_cast<void*>(
-                        screenViewRenderHook
-                    ),
-                    reinterpret_cast<void**>(
-                        &gScreenViewRenderOriginal
-                    )
-                );
-
-            if (hook->installed()) {
-                gHooks.push_back(
-                    std::move(hook)
-                );
-            } else {
-                logger.warn(
-                    "ScreenViewRender "
-                    "hook installation failed"
-                );
-            }
-        }
-
-        if (gItemRendererOriginal) {
-            auto hook =
-                std::make_unique<
-                    pl::memory::HookHandle
-                >(
-                    reinterpret_cast<void*>(
-                        gItemRendererOriginal
-                    ),
-                    reinterpret_cast<void*>(
-                        itemRendererHook
-                    ),
-                    reinterpret_cast<void**>(
-                        &gItemRendererOriginal
-                    )
-                );
-
-            if (hook->installed()) {
-                gHooks.push_back(
-                    std::move(hook)
-                );
-            } else {
-                logger.warn(
-                    "ItemRendererRenderGuiItemNew "
-                    "hook installation failed"
-                );
-            }
-        }
-
-        const auto drawTextAddress =
-            reinterpret_cast<void*>(
-                gDrawTextOriginal
-            );
-
-        if (drawTextAddress) {
-            auto hook =
-                std::make_unique<
-                    pl::memory::HookHandle
-                >(
-                    drawTextAddress,
-                    reinterpret_cast<void*>(
-                        drawTextHook
-                    ),
-                    reinterpret_cast<void**>(
-                        &gDrawTextOriginal
-                    )
-                );
-
-            if (hook->installed()) {
-                gHooks.push_back(
-                    std::move(hook)
-                );
-            } else {
-                logger.warn(
-                    "MinecraftUIRenderContext::DrawText "
-                    "hook installation failed"
-                );
-            }
-        }
-
-        logger.info(
-            "Item Highlighter enabled with "
-            "throttled inventory polling"
+            "Item Highlighter enabled"
         );
 
         return true;
@@ -850,8 +823,9 @@ public:
 
     bool disable() {
         gEnabled = false;
-        clearInventoryState();
-        gUiContext = nullptr;
+
+        clearState();
+
         return true;
     }
 
@@ -860,18 +834,18 @@ public:
 
         gHooks.clear();
 
-        clearInventoryState();
+        clearState();
 
-        gUiContext = nullptr;
-        gContainerGetItemStack = nullptr;
-        gItemDamage = nullptr;
+        gItemRendererOriginal = nullptr;
+        gScreenViewRenderOriginal = nullptr;
+        gDrawTextOriginal = nullptr;
         gFillRectangle = nullptr;
 
         return true;
     }
 
 private:
-    pl::log::Logger& getLogger() {
+    static pl::log::Logger& loggerRef() {
         static pl::log::Logger& logger =
             pl::log::Logger::getOrCreate(
                 "Item Highlighter"
