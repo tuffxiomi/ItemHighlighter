@@ -20,7 +20,7 @@ The implementation independently uses the same native concepts observed in the s
 
 - masked ARM64 signature resolution
 - Preloader detours
-- `ContainerScreenControllerOpen` / destructor lifecycle
+- `ContainerScreenControllerOpen`
 - `ContainerScreenControllerGetItemStack`
 - `ScreenViewRender`
 - `ItemRendererRenderGuiItemNew`
@@ -46,3 +46,7 @@ Local build prerequisites:
 - Ninja
 
 The GitHub workflow also packages a `.levipack` artifact.
+
+## Stability fix
+
+This build resolves native signatures during the loader/background phase, removes the unsupported `ContainerScreenControllerDtor` dependency, and throttles inventory polling to 250 ms to avoid main-thread ANRs. See `CRASH_ANALYSIS.md`.
